@@ -1,4 +1,7 @@
-const { Plugin, Notice, Scope, TFolder, TFile, normalizePath } = require('obsidian');
+const { Plugin, Notice, Scope, TFolder, TFile, normalizePath, PluginSettingTab, Setting } = require('obsidian');
+const fs = require('fs').promises;
+const path = require('path');
+const os = require('os');
 
 class LRUCache {
     constructor(maxSize = 100) {
@@ -37,9 +40,19 @@ class MediaGalleryPlugin extends Plugin {
         this.pendingRequests = new Map();
         this.workerPool = [];
         this.maxWorkers = 4;
+        this.settings = null;
+        this.lastImportStats = {
+            updatedAt: null,
+            movedCount: 0,
+            totalCount: 0,
+            ruleCounts: {}
+        };
     }
 
     async onload() {
+        await this.loadSettings();
+        this.addSettingTab(new MediaGallerySettingTab(this.app, this));
+
         this.initWorkerPool();
 
         this.processor = this.registerMarkdownCodeBlockProcessor('memories', async (source, el, ctx) => {
@@ -54,8 +67,41 @@ class MediaGalleryPlugin extends Plugin {
                 });
             }
         });
-        
+
         this.initIntersectionObserver();
+    }
+
+    async loadSettings() {
+        const data = await this.loadData();
+        const loaded = data || {};
+
+        let importRules;
+        if (loaded.importRules && Array.isArray(loaded.importRules)) {
+            importRules = loaded.importRules;
+        } else {
+            importRules = [
+                { prefix: loaded.chatgptPrefix || 'ChatGPT Image ', label: 'GPT', enabled: true },
+                { prefix: loaded.geminiPrefix || 'Gemini_Generated_Image_', label: 'Gemini', enabled: true }
+            ];
+        }
+
+        this.settings = {
+            sourceDir: loaded.sourceDir || path.join(os.homedir(), 'Downloads'),
+            targetFolder: loaded.targetFolder || 'pic',
+            noteFile: loaded.noteFile || 'Gemini Banana 图片浏览器.md',
+            lightboxFillWindow: loaded.lightboxFillWindow !== undefined ? loaded.lightboxFillWindow : false,
+            importRules
+        };
+        if (loaded.lastImportStats) {
+            this.lastImportStats = loaded.lastImportStats;
+            if (!this.lastImportStats.ruleCounts) {
+                this.lastImportStats.ruleCounts = {};
+            }
+        }
+    }
+
+    async saveSettings() {
+        await this.saveData(Object.assign({}, this.settings, { lastImportStats: this.lastImportStats }));
     }
 
     parseConfig(source) {
@@ -68,7 +114,8 @@ class MediaGalleryPlugin extends Plugin {
             displayType: 'full',
             limit: 50,
             batchSize: 10,
-            preloadCount: 3
+            preloadCount: 3,
+            maxHeight: null
         };
 
         const cleanPath = (p) => {
@@ -79,6 +126,11 @@ class MediaGalleryPlugin extends Plugin {
         
         for (let line of lines) {
             line = line.trim();
+            // Skip HTML comments and Markdown table rows that may have been
+            // accidentally written into the code block by old updateNoteTable
+            if (!line || line.startsWith('<!--') || line.startsWith('|') || line === '<!--') {
+                continue;
+            }
             if (line.startsWith('paths:')) {
                 const pathsStr = line.substring(6).trim();
                 config.paths = pathsStr
@@ -97,6 +149,9 @@ class MediaGalleryPlugin extends Plugin {
                 config.limit = parseInt(line.substring(6).trim()) || 50;
             } else if (line.startsWith('batch:')) {
                 config.batchSize = parseInt(line.substring(6).trim()) || 10;
+            } else if (line.startsWith('maxHeight:')) {
+                const val = line.substring(10).trim();
+                config.maxHeight = val || null;
             } else if (line && !line.includes(':')) {
                 config.paths = [cleanPath(line)];
             }
@@ -109,7 +164,7 @@ class MediaGalleryPlugin extends Plugin {
         if (config.displayType === 'compact' && !lines.some(line => line.trim().startsWith('limit:'))) {
             config.limit = 9;
         }
-        
+
         return config;
     }
 
@@ -269,14 +324,17 @@ class MediaGalleryPlugin extends Plugin {
     async createGallery(el, config, ctx) {
         el.empty();
         el.ctx = ctx;
-        
+        el.sourcePath = ctx.sourcePath;
+
         this.thumbnailCache.clear();
         this.pendingRequests.clear();
 
-        const loadingIndicator = el.createEl('div', { 
-            cls: 'memories-gallery-loading',
-            text: 'Loading gallery...' 
-        });
+        const loadingIndicator = el.createEl('div', { cls: 'memories-gallery-loading' });
+        // Show skeleton placeholders while loading
+        const skeletonCount = Math.min(config.limit || 8, 8);
+        for (let i = 0; i < skeletonCount; i++) {
+            loadingIndicator.createEl('div', { cls: 'memories-gallery-skeleton' });
+        }
         
         try {
             const controller = new AbortController();
@@ -335,59 +393,94 @@ class MediaGalleryPlugin extends Plugin {
     async renderGallery(el, files, config, signal) {
         const galleryContainer = el.createEl('div', { cls: 'memories-media-gallery-container' });
         galleryContainer.ctx = el.ctx;
+        galleryContainer.sourcePath = el.sourcePath;
         galleryContainer._config = config;
 
+        if (config.maxHeight) {
+            galleryContainer.classList.add('memories-gallery-fixed-frame');
+            galleryContainer.style.maxHeight = config.maxHeight;
+        }
+
         const infoBar = galleryContainer.createEl('div', { cls: 'memories-gallery-info-bar' });
-        
-        const leftInfo = infoBar.createEl('div', { cls: 'memories-gallery-info-left' });
-        const rightActions = infoBar.createEl('div', { cls: 'memories-gallery-info-right' });
-        
+
+        // Title row — full width
+        const titleRow = infoBar.createEl('div', { cls: 'memories-gallery-title-row' });
+        titleRow.createEl('div', {
+            cls: 'memories-gallery-title',
+            text: 'AI Gallery'
+        });
+
+        // Stats + buttons row — side by side
+        const bottomRow = infoBar.createEl('div', { cls: 'memories-gallery-bottom-row' });
+        const statsWrap = bottomRow.createEl('div', { cls: 'memories-gallery-stats-wrap' });
+        const rightActions = bottomRow.createEl('div', { cls: 'memories-gallery-info-right' });
+
         const totalBytes = files.reduce((sum, file) => sum + file.stat.size, 0);
         const totalSize = this.formatFileSize(totalBytes);
-        
-        const totalFilesItem = leftInfo.createEl('div', { cls: 'memories-info-item' });
-        totalFilesItem.createEl('span', { 
-            cls: 'memories-info-icon',
-            text: '🖼️' 
-        });
-        totalFilesItem.createEl('span', { 
-            cls: 'memories-info-text',
-            text: `${files.length} files` 
-        });
-        
-        const totalSizeItem = leftInfo.createEl('div', { cls: 'memories-info-item' });
-        totalSizeItem.createEl('span', { 
-            cls: 'memories-info-icon',
-            text: '💾' 
-        });
-        totalSizeItem.createEl('span', { 
-            cls: 'memories-info-text',
-            text: totalSize 
-        });
-        
-        if (config.displayType === 'compact') {
-            const showingItem = leftInfo.createEl('div', { cls: 'memories-info-item' });
-            showingItem.createEl('span', { 
-                cls: 'memories-info-icon',
-                text: '👁️' 
-            });
-            showingItem.createEl('span', { 
-                cls: 'memories-info-text',
-                text: `Showing ${Math.min(files.length, config.limit)}` 
-            });
+
+        const importRules = this.settings?.importRules || [];
+        const enabledRules = importRules.filter(r => r.enabled !== false);
+
+        const ruleCounts = {};
+        let totalImages = 0;
+
+        for (const rule of enabledRules) {
+            const count = files.filter(f => f.name.startsWith(rule.prefix) && f.name.endsWith('.png')).length;
+            ruleCounts[rule.prefix] = count;
+            totalImages += count;
         }
-        
-        this.createUploadButton(rightActions, config, files, galleryContainer);
-        
-        const grid = galleryContainer.createEl('div', { cls: 'memories-media-gallery-grid' });
+
+        const displayCount = config.displayType === 'compact'
+            ? Math.min(files.length, config.limit)
+            : files.length;
+
+        const updatedAt = this.lastImportStats.updatedAt
+            ? this.formatCompactDateTime(this.lastImportStats.updatedAt)
+            : '未导入';
+
+        const stats = [
+            ['更新', updatedAt],
+            ['本次', this.lastImportStats.movedCount || 0],
+            ['图片', totalImages],
+            ['显示', displayCount]
+        ];
+
+        for (const rule of enabledRules) {
+            const count = ruleCounts[rule.prefix] || 0;
+            const label = rule.label || rule.prefix || '规则';
+            stats.push([label, count]);
+        }
+
+        stats.push(['占用', totalSize]);
+
+        const table = statsWrap.createEl('table', { cls: 'memories-gallery-meta-table' });
+
+        const thead = table.createEl('thead');
+        const headRow = thead.createEl('tr');
+
+        for (const [label] of stats) {
+            headRow.createEl('th', { text: label });
+        }
+
+        const tbody = table.createEl('tbody');
+        const valueRow = tbody.createEl('tr');
+
+        for (const [, value] of stats) {
+            valueRow.createEl('td', { text: String(value) });
+        }
+
+        this.createImportButton(rightActions, config, files, galleryContainer);
+
+        const galleryBody = galleryContainer.createEl('div', { cls: 'memories-gallery-body' });
+        const grid = galleryBody.createEl('div', { cls: 'memories-media-gallery-grid' });
         grid.style.setProperty('--memories-grid-size', `${config.gridSize}px`);
-        
-        const filesToDisplay = config.displayType === 'compact' ? 
-            files.slice(0, config.limit) : 
+
+        const filesToDisplay = config.displayType === 'compact' ?
+            files.slice(0, config.limit) :
             files;
-        
+
         grid.dataset.allFiles = JSON.stringify(files.map(f => ({ name: f.name, path: f.path })));
-        
+
         await this.renderBatchItems(grid, filesToDisplay, config, signal, 0);
     }
 
@@ -502,13 +595,17 @@ class MediaGalleryPlugin extends Plugin {
                 loading: 'lazy'
             }
         });
-        
+
+        // Filename overlay on hover
+        const overlay = element.createEl('div', { cls: 'memories-card-filename' });
+        overlay.setText(file.name);
+
         requestIdleCallback(() => {
             this.registerDomEvent(img, 'click', () => {
                 const galleryContainer = element.closest('.memories-media-gallery-container');
                 openMediaLightbox(this.app, allMediaFiles || [file], index || 0, () => {
                     this.refreshCurrentGallery(galleryContainer);
-                }, galleryContainer);
+                }, galleryContainer, this.settings.lightboxFillWindow);
             });
         });
     }
@@ -548,13 +645,17 @@ class MediaGalleryPlugin extends Plugin {
         
         const playIcon = container.createEl('div', { cls: 'memories-video-play-icon' });
         playIcon.setText('▶');
-        
+
+        // Filename overlay on hover
+        const overlay = element.createEl('div', { cls: 'memories-card-filename' });
+        overlay.setText(file.name);
+
         requestIdleCallback(() => {
             this.registerDomEvent(element, 'click', () => {
                 const galleryContainer = element.closest('.memories-media-gallery-container');
                 openMediaLightbox(this.app, allMediaFiles || [file], index || 0, () => {
                     this.refreshCurrentGallery(galleryContainer);
-                }, galleryContainer);
+                }, galleryContainer, this.settings.lightboxFillWindow);
             });
         });
     }
@@ -563,38 +664,45 @@ class MediaGalleryPlugin extends Plugin {
         const container = element.createEl('div', { cls: 'memories-audio-thumbnail-container' });
         const icon = container.createEl('div', { cls: 'memories-audio-icon' });
         icon.setText('🎵');
-        
+
         const fileName = container.createEl('div', { cls: 'memories-audio-filename' });
         fileName.textContent = file.name;
-        
+
+        // Filename overlay on hover
+        const overlay = element.createEl('div', { cls: 'memories-card-filename' });
+        overlay.setText(file.name);
+
         requestIdleCallback(() => {
             this.registerDomEvent(container, 'click', () => {
                 const galleryContainer = element.closest('.memories-media-gallery-container');
                 openMediaLightbox(this.app, allMediaFiles || [file], index || 0, () => {
                     this.refreshCurrentGallery(galleryContainer);
-                }, galleryContainer);
+                }, galleryContainer, this.settings.lightboxFillWindow);
             });
         });
     }
 
     async refreshCurrentGallery(galleryContainer) {
         if (!galleryContainer) return;
-        
+
         try {
             const parentEl = galleryContainer.parentElement;
             const config = galleryContainer._config;
             const ctx = galleryContainer.ctx;
-            
+            const sourcePath = galleryContainer.sourcePath;
+
             if (parentEl && config && ctx) {
                 galleryContainer.classList.add('memories-gallery-refreshing');
-                
+
                 const scrollPos = window.scrollY;
-                
+
                 parentEl.empty();
+                parentEl.ctx = ctx;
+                parentEl.sourcePath = sourcePath;
                 await this.createGallery(parentEl, config, ctx);
-                
+
                 window.scrollTo(0, scrollPos);
-                
+
                 galleryContainer.classList.remove('memories-gallery-refreshing');
             }
         } catch (error) {
@@ -700,14 +808,23 @@ class MediaGalleryPlugin extends Plugin {
         return array;
     }
 
-    createUploadButton(container, config, files, galleryContainer) {
-        const uploadBtn = container.createEl('button', {
-            text: '📤 Upload media',
+    createImportButton(container, config, files, galleryContainer) {
+        const importBtn = container.createEl('button', {
+            text: '导入图片',
             cls: 'memories-gallery-upload-btn'
         });
-        
-        this.registerDomEvent(uploadBtn, 'click', () => {
-            this.showUploadForm(config, files, galleryContainer);
+
+        this.registerDomEvent(importBtn, 'click', () => {
+            this.importImages(config, files, galleryContainer, importBtn);
+        });
+
+        const settingsBtn = container.createEl('button', {
+            text: '设置',
+            cls: 'memories-gallery-settings-btn'
+        });
+
+        this.registerDomEvent(settingsBtn, 'click', () => {
+            this.openSettings();
         });
     }
 
@@ -936,15 +1053,44 @@ class MediaGalleryPlugin extends Plugin {
         const k = 1024;
         const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
         const i = Math.floor(Math.log(bytes) / Math.log(k));
-        
+
         let size = parseFloat((bytes / Math.pow(k, i)).toFixed(2));
         let unit = sizes[i];
-        
+
         if (unit === 'GB' || unit === 'TB') {
             size = Math.round(size * 10) / 10;
         }
-        
+
         return `${size} ${unit}`;
+    }
+
+    formatDateTime(isoString) {
+        if (!isoString) return '尚未导入';
+        const d = new Date(isoString);
+        if (isNaN(d.getTime())) return '尚未导入';
+        const pad = (n) => String(n).padStart(2, '0');
+        return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    }
+
+    formatCompactDateTime(isoString) {
+        if (!isoString) return '未导入';
+
+        const d = new Date(isoString);
+        if (isNaN(d.getTime())) return '未导入';
+
+        const now = new Date();
+        const pad = (n) => String(n).padStart(2, '0');
+
+        const sameDay =
+            d.getFullYear() === now.getFullYear() &&
+            d.getMonth() === now.getMonth() &&
+            d.getDate() === now.getDate();
+
+        if (sameDay) {
+            return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+        }
+
+        return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
     }
 
     async handleFileUpload(files, targetPath, config, galleryContainer) {
@@ -991,12 +1137,266 @@ class MediaGalleryPlugin extends Plugin {
         return newName;
     }
 
+    sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
     async refreshGallery(container, config) {
         const parentEl = container.parentElement;
         const ctx = parentEl.ctx;
-        
+        const sourcePath = parentEl.sourcePath;
+
         parentEl.empty();
+        parentEl.ctx = ctx;
+        parentEl.sourcePath = sourcePath;
+
+        // Give vault a moment to register newly written files
+        await this.sleep(150);
         await this.createGallery(parentEl, config, ctx);
+    }
+
+    async importImages(config, files, galleryContainer, importBtn) {
+        importBtn.disabled = true;
+        importBtn.textContent = '导入中...';
+
+        try {
+            const { sourceDir, importRules } = this.settings;
+
+            const galleryTargetFolder = config.paths?.find(p => p && p !== './');
+            const targetFolder = normalizePath(galleryTargetFolder || this.settings.targetFolder || 'pic');
+
+            const vaultAdapter = this.app.vault.adapter;
+            const vaultBasePath = vaultAdapter.getBasePath ? vaultAdapter.getBasePath() : (this.app.vault.adapter.basePath || '');
+            const targetDirAbs = path.join(vaultBasePath, targetFolder);
+
+            const matchedFiles = await this.scanSourceDir(sourceDir, importRules);
+
+            let movedCount = 0;
+            const moved = [];
+            const skipped = [];
+            const failed = [];
+
+            if (matchedFiles.length === 0) {
+                console.log('[AI Gallery] 未检测到新的目标图片');
+            }
+
+            for (const srcPath of matchedFiles) {
+                try {
+                    const fileName = path.basename(srcPath);
+                    const destPath = path.join(targetDirAbs, fileName);
+                    const vaultPath = normalizePath(targetFolder + '/' + fileName);
+
+                    const existsInTarget = this.app.vault.getAbstractFileByPath(vaultPath);
+                    if (existsInTarget) {
+                        skipped.push(fileName);
+                        continue;
+                    }
+
+                    await fs.mkdir(path.dirname(destPath), { recursive: true });
+
+                    const buffer = await fs.readFile(srcPath);
+                    await this.app.vault.createBinary(vaultPath, buffer);
+
+                    await fs.unlink(srcPath);
+
+                    movedCount++;
+                    moved.push(fileName);
+                    console.log(`[AI Gallery] 已导入: ${fileName}`);
+                } catch (err) {
+                    failed.push({ file: path.basename(srcPath), error: err.message });
+                    console.error(`[AI Gallery] 导入失败: ${path.basename(srcPath)}`, err);
+                }
+            }
+
+            if (moved.length > 0) {
+                console.log(`[AI Gallery] 已移动 ${moved.length} 张图片`);
+            }
+            if (skipped.length > 0) {
+                console.log(`[AI Gallery] 已跳过 ${skipped.length} 张（目标已存在）`);
+            }
+            if (failed.length > 0) {
+                console.log(`[AI Gallery] 失败 ${failed.length} 张`);
+            }
+
+            const stats = await this.countImagesInTarget(targetDirAbs, importRules);
+            const updatedAt = new Date().toISOString();
+
+            this.lastImportStats = {
+                updatedAt,
+                movedCount,
+                totalCount: stats.totalCount,
+                ruleCounts: stats.ruleCounts || {}
+            };
+
+            await this.saveSettings();
+
+            if (movedCount === 0) {
+                new Notice('未检测到新的目标图片');
+            } else {
+                new Notice(`已经更新 ${movedCount} 张图片 → ${targetFolder}`);
+                await this.refreshGallery(galleryContainer, config);
+            }
+
+        } catch (error) {
+            console.error('[AI Gallery] 图片导入失败:', error);
+            new Notice('图片导入失败');
+        } finally {
+            importBtn.disabled = false;
+            importBtn.textContent = '导入图片';
+        }
+    }
+
+    async scanSourceDir(sourceDir, importRules) {
+        const results = [];
+        const enabledRules = importRules.filter(r => r.enabled !== false);
+
+        async function walk(dir) {
+            let entries;
+            try {
+                entries = await fs.readdir(dir, { withFileTypes: true });
+            } catch {
+                return;
+            }
+            for (const entry of entries) {
+                const fullPath = path.join(dir, entry.name);
+                if (entry.isDirectory()) {
+                    await walk(fullPath);
+                } else if (entry.isFile()) {
+                    const name = entry.name;
+                    if (!name.endsWith('.png')) continue;
+                    if (enabledRules.some(r => name.startsWith(r.prefix))) {
+                        results.push(fullPath);
+                    }
+                }
+            }
+        }
+
+        await walk(sourceDir);
+        return results;
+    }
+
+    async countImagesInTarget(targetDirAbs, importRules) {
+        const enabledRules = importRules.filter(r => r.enabled !== false);
+        const ruleCounts = {};
+        enabledRules.forEach(r => { ruleCounts[r.prefix] = 0; });
+
+        let totalCount = 0;
+
+        async function walk(dir) {
+            let entries;
+            try {
+                entries = await fs.readdir(dir, { withFileTypes: true });
+            } catch {
+                return;
+            }
+            for (const entry of entries) {
+                const fullPath = path.join(dir, entry.name);
+                if (entry.isDirectory()) {
+                    await walk(fullPath);
+                } else if (entry.isFile() && entry.name.endsWith('.png')) {
+                    for (const rule of enabledRules) {
+                        if (entry.name.startsWith(rule.prefix)) {
+                            ruleCounts[rule.prefix] = (ruleCounts[rule.prefix] || 0) + 1;
+                            totalCount++;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        await walk(targetDirAbs);
+        return { totalCount, ruleCounts };
+    }
+
+    async loadTargetDirFiles(targetFolder) {
+        const folder = this.app.vault.getAbstractFileByPath(targetFolder);
+        if (!(folder instanceof TFolder)) return [];
+        const files = [];
+        for (const child of folder.children) {
+            if (child instanceof TFile && this.isMediaFile(child.name)) {
+                files.push(child);
+            }
+        }
+        return files;
+    }
+
+    async updateNoteTable(totalBytes, sourcePath) {
+        const { noteFile, summaryLineNo } = this.settings;
+        const targetNotePath = sourcePath || noteFile;
+
+        const totalBytesForDisplay = this.formatFileSize(totalBytes);
+        const updatedAt = this.lastImportStats.updatedAt
+            ? this.formatDateTime(this.lastImportStats.updatedAt)
+            : '尚未导入';
+        const movedCount = this.lastImportStats.movedCount;
+
+        const gptTotal = this.lastImportStats.gptTotal;
+        const geminiTotal = this.lastImportStats.geminiTotal;
+        const totalImages = this.lastImportStats.totalCount;
+        const displayCount = totalImages;
+
+        const tableContent = [
+            '<!-- image-update-table-start -->',
+            '| 更新时间 | 更新数量 | 图片总数 | 显示总数 | GPT 图片总数 | Gemini 图片总数 | 硬盘占用 |',
+            '|---|---:|---:|---:|---:|---:|---:|',
+            `| ${updatedAt} | ${movedCount} | ${totalImages} | ${displayCount} | ${gptTotal} | ${geminiTotal} | ${totalBytesForDisplay} |`,
+            '<!-- image-update-table-end -->'
+        ].join('\n');
+
+        const tableRegex = /<!-- image-update-table-start -->[\s\S]*<!-- image-update-table-end -->/;
+        const placeholderRegex = /<!-- ai-gallery-stats -->/;
+
+        try {
+            const noteAbsPath = normalizePath(targetNotePath);
+            const noteFileObj = this.app.vault.getAbstractFileByPath(noteAbsPath);
+
+            if (!noteFileObj) {
+                console.warn(`[AI Gallery] 统计表更新失败：找不到笔记 ${targetNotePath}`);
+                new Notice(`统计表更新失败：找不到当前笔记`);
+                return;
+            }
+
+            const content = await this.app.vault.read(noteFileObj);
+
+            let newContent;
+            if (tableRegex.test(content)) {
+                // Priority 1: replace existing table block
+                newContent = content.replace(tableRegex, tableContent);
+            } else if (placeholderRegex.test(content)) {
+                // Priority 2: replace <!-- ai-gallery-stats --> placeholder
+                newContent = content.replace(placeholderRegex, tableContent);
+            } else {
+                // Priority 3: replace line at summaryLineNo (1-based)
+                const lines = content.split('\n');
+                const index = Math.max(0, summaryLineNo - 1);
+                while (lines.length <= index) {
+                    lines.push('');
+                }
+                lines.splice(index, 1, tableContent);
+                newContent = lines.join('\n');
+            }
+
+            await this.app.vault.modify(noteFileObj, newContent);
+            console.log(`[AI Gallery] 已更新统计表: ${noteAbsPath}`);
+        } catch (err) {
+            console.error('[AI Gallery] 更新统计表失败:', err);
+            new Notice(`统计表更新失败：${err.message}`);
+        }
+    }
+
+    openSettings() {
+        try {
+            if (this.app.setting?.open) {
+                this.app.setting.open();
+                this.app.setting.openTabById(this.manifest.id);
+            } else {
+                new Notice('无法打开插件设置，请到设置中手动打开 AI Gallery');
+            }
+        } catch (err) {
+            console.error('[AI Gallery] 打开设置失败:', err);
+            new Notice('打开设置失败，请到设置中手动打开 AI Gallery');
+        }
     }
 
     onunload() {
@@ -1084,66 +1484,38 @@ function updateThumbnails(state) {
         
         thumb.addEventListener('click', () => {
             state.currentIndex = i;
-            state.randomMode = false;
-            updateRandomButton(state, state.randomBtn);
             updateMedia(state, state.fileLink, state.fileMeta);
         });
-        
+
         thumbContainer.appendChild(thumb);
     }
 }
 
-function openMediaLightbox(app, mediaFiles, startIndex, onFileDeleted, galleryContainer) {
+function openMediaLightbox(app, mediaFiles, startIndex, onFileDeleted, galleryContainer, lightboxFillWindow) {
     const existing = document.getElementById('memories-lightbox-overlay');
     if (existing) existing.remove();
 
     const state = {
         currentIndex: startIndex,
-        randomMode: false,
         mediaFiles: mediaFiles,
         app: app,
-        slideshowInterval: null,
-        slideshowActive: false,
         onFileDeleted: onFileDeleted,
         galleryContainer: galleryContainer,
+        lightboxFillWindow: lightboxFillWindow,
         scope: new Scope()
     };
 
     const overlay = document.createElement('div');
     overlay.id = 'memories-lightbox-overlay';
+    if (!lightboxFillWindow) {
+        overlay.classList.add('memories-lightbox-dark');
+    }
 
     const topBar = document.createElement('div');
     topBar.className = 'memories-lightbox-topbar';
 
     const leftControls = document.createElement('div');
     leftControls.className = 'memories-lightbox-controls-left';
-
-    const randomBtn = document.createElement('button');
-    randomBtn.className = 'memories-lightbox-random-btn';
-    randomBtn.textContent = '🎲 Random shuffle';
-    randomBtn.addEventListener('click', () => toggleRandom(state, randomBtn));
-
-    const slideshowContainer = document.createElement('div');
-    slideshowContainer.className = 'memories-lightbox-slideshow-container';
-
-    const intervalInput = document.createElement('input');
-    intervalInput.type = 'number';
-    intervalInput.className = 'memories-lightbox-interval-input';
-    intervalInput.value = '3';
-    intervalInput.min = '1';
-    intervalInput.max = '60';
-    intervalInput.placeholder = 'sec';
-
-    const slideshowBtn = document.createElement('button');
-    slideshowBtn.className = 'memories-lightbox-slideshow-btn';
-    slideshowBtn.textContent = '▶ Start slideshow';
-    slideshowBtn.addEventListener('click', () => toggleSlideshow(state, slideshowBtn, intervalInput));
-
-    slideshowContainer.appendChild(intervalInput);
-    slideshowContainer.appendChild(slideshowBtn);
-
-    leftControls.appendChild(randomBtn);
-    leftControls.appendChild(slideshowContainer);
 
     const rightControls = document.createElement('div');
     rightControls.className = 'memories-lightbox-controls-right';
@@ -1246,8 +1618,6 @@ function openMediaLightbox(app, mediaFiles, startIndex, onFileDeleted, galleryCo
 
         thumb.addEventListener('click', () => {
             state.currentIndex = i;
-            state.randomMode = false;
-            updateRandomButton(state, randomBtn);
             updateMedia(state, fileLink, fileMeta);
         });
 
@@ -1306,18 +1676,14 @@ function openMediaLightbox(app, mediaFiles, startIndex, onFileDeleted, galleryCo
     overlay.appendChild(thumbContainer);
     document.body.appendChild(overlay);
 
-    state.randomBtn = randomBtn;
-    state.slideshowBtn = slideshowBtn;
     state.fileLink = fileLink;
     state.fileMeta = fileMeta;
-    state.intervalInput = intervalInput;
 
     updateMedia(state, fileLink, fileMeta);
 
     state.scope.register([], 'ArrowLeft', () => { navigate(state, -1); return false; });
     state.scope.register([], 'ArrowRight', () => { navigate(state, 1); return false; });
     state.scope.register([], 'Escape', () => { closeLightbox(state); return false; });
-    state.scope.register([], 'Space', () => { toggleSlideshow(state, slideshowBtn, intervalInput); return false; });
 
     const wheelHandler = (e) => {
         if (document.querySelector('img:hover, video:hover')) return;
@@ -1335,9 +1701,6 @@ function openMediaLightbox(app, mediaFiles, startIndex, onFileDeleted, galleryCo
     overlay.addEventListener('cleanup', () => {
         state.scope.unregister();
         mainArea.removeEventListener('wheel', wheelHandler);
-        if (state.slideshowInterval) {
-            clearInterval(state.slideshowInterval);
-        }
     });
 }
 
@@ -1348,41 +1711,16 @@ function updateFileMeta(fileMeta, file) {
 }
 
 function closeLightbox(state) {
-    if (state && state.slideshowInterval) {
-        clearInterval(state.slideshowInterval);
-    }
-
     const overlay = document.getElementById('memories-lightbox-overlay');
     if (overlay) {
         overlay.dispatchEvent(new Event('cleanup'));
         overlay.remove();
     }
-    
+
     if (state && state.galleryContainer && state.onFileDeleted) {
         setTimeout(() => {
             state.onFileDeleted();
         }, 100);
-    }
-}
-
-function toggleSlideshow(state, slideshowBtn, intervalInput) {
-    if (state.slideshowActive) {
-        clearInterval(state.slideshowInterval);
-        state.slideshowInterval = null;
-        state.slideshowActive = false;
-        slideshowBtn.textContent = '▶ Start slideshow';
-        slideshowBtn.classList.remove('active');
-        intervalInput.disabled = false;
-    } else {
-        const interval = parseInt(intervalInput.value) || 3;
-        state.slideshowActive = true;
-        slideshowBtn.textContent = '⏸ Stop slideshow';
-        slideshowBtn.classList.add('active');
-        intervalInput.disabled = true;
-
-        state.slideshowInterval = window.setInterval(() => {
-            navigate(state, 1);
-        }, interval * 1000);
     }
 }
 
@@ -1393,36 +1731,8 @@ function openFileInExplorer(app, state) {
     }
 }
 
-function toggleRandom(state, randomBtn) {
-    state.randomMode = !state.randomMode;
-    updateRandomButton(state, randomBtn);
-}
-
-function updateRandomButton(state, randomBtn) {
-    if (state.randomMode) {
-        randomBtn.classList.add('active');
-        randomBtn.textContent = '🎲 Random shuffle (ON)';
-    } else {
-        randomBtn.classList.remove('active');
-        randomBtn.textContent = '🎲 Random shuffle';
-    }
-}
-
-function getRandomIndex(state) {
-    let newIndex;
-    do {
-        newIndex = Math.floor(Math.random() * state.mediaFiles.length);
-    } while (newIndex === state.currentIndex && state.mediaFiles.length > 1);
-    return newIndex;
-}
-
 function navigate(state, direction) {
-    if (state.randomMode) {
-        state.currentIndex = getRandomIndex(state);
-    } else {
-        state.currentIndex = (state.currentIndex + direction + state.mediaFiles.length) % state.mediaFiles.length;
-    }
-
+    state.currentIndex = (state.currentIndex + direction + state.mediaFiles.length) % state.mediaFiles.length;
     updateMedia(state, state.fileLink, state.fileMeta);
 }
 
@@ -1577,6 +1887,197 @@ function isVideo(filename) {
 function isAudio(filename) {
     const ext = filename.split('.').pop().toLowerCase();
     return ['mp3', 'wav', 'flac', 'ogg', 'aac', 'm4a', 'wma', 'opus', 'aiff', 'au'].includes(ext);
+}
+
+class MediaGallerySettingTab extends PluginSettingTab {
+    constructor(app, plugin) {
+        super(app, plugin);
+        this.plugin = plugin;
+        this.openRuleIndex = null;
+    }
+
+    display() {
+        const { containerEl } = this;
+        containerEl.empty();
+        containerEl.addClass('ai-gallery-settings');
+
+        containerEl.createEl('h2', { text: 'AI Gallery 设置' });
+
+        this.renderBasicSection(containerEl);
+        this.renderRulesSection(containerEl);
+    }
+
+    renderBasicSection(containerEl) {
+        const section = containerEl.createEl('div', { cls: 'ai-gallery-settings-section' });
+        section.createEl('div', { cls: 'ai-gallery-section-title', text: '基础设置' });
+        section.createEl('div', {
+            cls: 'ai-gallery-section-desc',
+            text: '只保留日常最常用的两个路径设置。'
+        });
+
+        new Setting(section)
+            .setName('来源目录')
+            .setDesc('扫描图片的外部来源目录，例如 Downloads。')
+            .addText(text => text
+                .setPlaceholder(path.join(os.homedir(), 'Downloads'))
+                .setValue(this.plugin.settings.sourceDir || path.join(os.homedir(), 'Downloads'))
+                .onChange(async (value) => {
+                    this.plugin.settings.sourceDir = value.trim() || path.join(os.homedir(), 'Downloads');
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(section)
+            .setName('默认导入文件夹')
+            .setDesc('当 memories 代码块没有指定 paths 时使用；如果代码块写了 paths，会优先导入到该 paths。')
+            .addText(text => text
+                .setPlaceholder('pic')
+                .setValue(this.plugin.settings.targetFolder || 'pic')
+                .onChange(async (value) => {
+                    this.plugin.settings.targetFolder = value.trim() || 'pic';
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(section)
+            .setName('灯箱模式 · 自动填充满窗口')
+            .setDesc('开启后图片会拉伸填满灯箱窗口；关闭后图片以原始尺寸居中展示，周围使用暗色背景。')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.lightboxFillWindow)
+                .onChange(async (value) => {
+                    this.plugin.settings.lightboxFillWindow = value;
+                    await this.plugin.saveSettings();
+                }));
+    }
+
+    renderRulesSection(containerEl) {
+        const section = containerEl.createEl('div', { cls: 'ai-gallery-settings-section' });
+        section.createEl('div', { cls: 'ai-gallery-section-title', text: '导入规则' });
+        section.createEl('div', {
+            cls: 'ai-gallery-section-desc',
+            text: '规则默认折叠，只显示名称和前缀；需要修改时再点"编辑"。'
+        });
+
+        const rulesList = section.createEl('div', { cls: 'ai-gallery-rule-list' });
+
+        const rules = Array.isArray(this.plugin.settings.importRules)
+            ? this.plugin.settings.importRules
+            : [];
+
+        if (rules.length === 0) {
+            rulesList.createEl('div', {
+                cls: 'ai-gallery-empty-rules',
+                text: '暂无导入规则。点击下方按钮添加。'
+            });
+        }
+
+        rules.forEach((rule, index) => {
+            this.renderRuleCard(rulesList, rule, index);
+        });
+
+        const addBtn = section.createEl('button', {
+            text: '+ 添加规则',
+            cls: 'ai-gallery-rule-add-btn'
+        });
+
+        addBtn.addEventListener('click', async () => {
+            this.plugin.settings.importRules.push({
+                label: '新规则',
+                prefix: '',
+                enabled: true
+            });
+            this.openRuleIndex = this.plugin.settings.importRules.length - 1;
+            await this.plugin.saveSettings();
+            this.display();
+        });
+    }
+
+    renderRuleCard(container, rule, index) {
+        const card = container.createEl('div', { cls: 'ai-gallery-rule-card' });
+        const isOpen = this.openRuleIndex === index;
+
+        if (isOpen) {
+            card.addClass('is-open');
+        }
+
+        const summary = card.createEl('div', { cls: 'ai-gallery-rule-summary' });
+
+        const meta = summary.createEl('div', { cls: 'ai-gallery-rule-meta' });
+        meta.createEl('div', {
+            cls: 'ai-gallery-rule-title',
+            text: rule.label || '未命名规则'
+        });
+        meta.createEl('div', {
+            cls: 'ai-gallery-rule-prefix',
+            text: rule.prefix || '未设置前缀'
+        });
+
+        const actions = summary.createEl('div', { cls: 'ai-gallery-rule-actions' });
+
+        const enabledLabel = actions.createEl('label', { cls: 'ai-gallery-rule-toggle-wrap' });
+        const enabledInput = enabledLabel.createEl('input', {
+            attr: { type: 'checkbox' }
+        });
+        enabledInput.checked = rule.enabled !== false;
+        enabledLabel.createEl('span', { text: '启用' });
+
+        enabledInput.addEventListener('change', async () => {
+            this.plugin.settings.importRules[index].enabled = enabledInput.checked;
+            await this.plugin.saveSettings();
+        });
+
+        const editBtn = actions.createEl('button', {
+            text: isOpen ? '收起' : '编辑',
+            cls: 'ai-gallery-rule-edit-btn'
+        });
+
+        editBtn.addEventListener('click', () => {
+            this.openRuleIndex = isOpen ? null : index;
+            this.display();
+        });
+
+        const deleteBtn = actions.createEl('button', {
+            text: '删除',
+            cls: 'ai-gallery-rule-delete-btn'
+        });
+
+        deleteBtn.addEventListener('click', async () => {
+            const name = rule.label || rule.prefix || '未命名规则';
+            if (!confirm(`确定删除规则"${name}"吗？`)) return;
+
+            this.plugin.settings.importRules.splice(index, 1);
+            this.openRuleIndex = null;
+            await this.plugin.saveSettings();
+            this.display();
+        });
+
+        const editor = card.createEl('div', { cls: 'ai-gallery-rule-editor' });
+
+        const labelRow = editor.createEl('div', { cls: 'ai-gallery-rule-input-row' });
+        labelRow.createEl('label', { text: '显示名称' });
+        const labelInput = labelRow.createEl('input', {
+            attr: { type: 'text', placeholder: '例如：GPT' }
+        });
+        labelInput.value = rule.label || '';
+
+        labelInput.addEventListener('change', async () => {
+            this.plugin.settings.importRules[index].label = labelInput.value.trim();
+            await this.plugin.saveSettings();
+            this.display();
+        });
+
+        const prefixRow = editor.createEl('div', { cls: 'ai-gallery-rule-input-row' });
+        prefixRow.createEl('label', { text: '文件名前缀' });
+        const prefixInput = prefixRow.createEl('input', {
+            attr: { type: 'text', placeholder: '例如：ChatGPT Image ' }
+        });
+        prefixInput.value = rule.prefix || '';
+
+        prefixInput.addEventListener('change', async () => {
+            this.plugin.settings.importRules[index].prefix = prefixInput.value;
+            await this.plugin.saveSettings();
+            this.display();
+        });
+    }
+
 }
 
 module.exports = MediaGalleryPlugin;
