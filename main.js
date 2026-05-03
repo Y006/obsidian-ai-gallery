@@ -1173,7 +1173,6 @@ class MediaGalleryPlugin extends Plugin {
 
             let movedCount = 0;
             const moved = [];
-            const skipped = [];
             const failed = [];
 
             if (matchedFiles.length === 0) {
@@ -1182,15 +1181,22 @@ class MediaGalleryPlugin extends Plugin {
 
             for (const srcPath of matchedFiles) {
                 try {
-                    const fileName = path.basename(srcPath);
-                    const destPath = path.join(targetDirAbs, fileName);
-                    const vaultPath = normalizePath(targetFolder + '/' + fileName);
+                    const originalName = path.basename(srcPath);
 
-                    const existsInTarget = this.app.vault.getAbstractFileByPath(vaultPath);
-                    if (existsInTarget) {
-                        skipped.push(fileName);
-                        continue;
+                    const conflictExists = this.app.vault.getAbstractFileByPath(
+                        normalizePath(targetFolder + '/' + originalName)
+                    );
+
+                    let finalName;
+                    if (conflictExists) {
+                        finalName = this.getUniqueFileName(targetFolder, originalName);
+                        console.log(`[AI Gallery] 同名去重: ${originalName} → ${finalName}`);
+                    } else {
+                        finalName = originalName;
                     }
+
+                    const vaultPath = normalizePath(targetFolder + '/' + finalName);
+                    const destPath = path.join(targetDirAbs, finalName);
 
                     await fs.mkdir(path.dirname(destPath), { recursive: true });
 
@@ -1200,8 +1206,8 @@ class MediaGalleryPlugin extends Plugin {
                     await fs.unlink(srcPath);
 
                     movedCount++;
-                    moved.push(fileName);
-                    console.log(`[AI Gallery] 已导入: ${fileName}`);
+                    moved.push(finalName);
+                    console.log(`[AI Gallery] 已导入: ${finalName}`);
                 } catch (err) {
                     failed.push({ file: path.basename(srcPath), error: err.message });
                     console.error(`[AI Gallery] 导入失败: ${path.basename(srcPath)}`, err);
@@ -1210,9 +1216,6 @@ class MediaGalleryPlugin extends Plugin {
 
             if (moved.length > 0) {
                 console.log(`[AI Gallery] 已移动 ${moved.length} 张图片`);
-            }
-            if (skipped.length > 0) {
-                console.log(`[AI Gallery] 已跳过 ${skipped.length} 张（目标已存在）`);
             }
             if (failed.length > 0) {
                 console.log(`[AI Gallery] 失败 ${failed.length} 张`);
