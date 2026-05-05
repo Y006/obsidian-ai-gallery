@@ -2,6 +2,25 @@
 
 AI Gallery 是一个 Obsidian 插件，基于 [obsidian-memories](https://github.com/DIMFLIX/obsidian-memories) 改造而来，用于在 Obsidian 中构建本地的 AI 生成图片浏览器。它能够在笔记中以自适应网格的形式展示本地文件夹中的图片、视频和音频文件，并提供便捷的导入、预览和管理功能。
 
+## 截图展示
+
+<div style="display: flex; gap: 12px; text-align: center; align-items: flex-start;">
+  <div style="width: 33.33%;">
+    <img src="media/readme/Screenshot 2026-05-05 at 11.53.17.png" style="width: 100%;">
+    <div>图 1：文章内瀑布流</div>
+  </div>
+
+  <div style="width: 33.33%;">
+    <img src="media/readme/macshot_2026-05-05_11-56-08.png" style="width: 100%;">
+    <div>图 2：灯箱大图展示</div>
+  </div>
+
+  <div style="width: 33.33%;">
+    <img src="media/readme/Screenshot 2026-05-05 at 11.53.30.png" style="width: 100%;">
+    <div>图 3：设置页面</div>
+  </div>
+</div>
+
 ## 使用方法
 
 在任意笔记中插入一个 `memories` 代码块，AI Gallery 就会自动扫描你指定的文件夹，将所有媒体文件以网格形式渲染在该代码块的位置。
