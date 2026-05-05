@@ -4,22 +4,25 @@ AI Gallery 是一个 Obsidian 插件，基于 [obsidian-memories](https://github
 
 ## 截图展示
 
-<div style="display: flex; gap: 12px; text-align: center; align-items: flex-start;">
-  <div style="width: 33.33%;">
-    <img src="media/readme/Screenshot 2026-05-05 at 11.53.17.png" style="width: 100%;">
-    <div>图 1：文章内瀑布流</div>
-  </div>
-
-  <div style="width: 33.33%;">
-    <img src="media/readme/macshot_2026-05-05_11-56-08.png" style="width: 100%;">
-    <div>图 2：灯箱大图展示</div>
-  </div>
-
-  <div style="width: 33.33%;">
-    <img src="media/readme/Screenshot 2026-05-05 at 11.53.30.png" style="width: 100%;">
-    <div>图 3：设置页面</div>
-  </div>
-</div>
+<table>
+  <tr>
+    <td align="center" width="33%">
+      <img src="media/readme/Screenshot%202026-05-05%20at%2011.53.17.png" width="100%">
+      <br>
+      图 1：文章内瀑布流
+    </td>
+    <td align="center" width="33%">
+      <img src="media/readme/macshot_2026-05-05_11-56-08.png" width="100%">
+      <br>
+      图 2：灯箱大图展示
+    </td>
+    <td align="center" width="33%">
+      <img src="media/readme/Screenshot%202026-05-05%20at%2011.53.30.png" width="100%">
+      <br>
+      图 3：设置页面
+    </td>
+  </tr>
+</table>
 
 ## 使用方法
 
